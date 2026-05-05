@@ -6,10 +6,8 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/url"
 	"os/exec"
-	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -90,7 +88,8 @@ func handleTask(c *websocket.Conn, req TaskRequest) {
 		cmd := exec.Command("mtr", "-r", "-c", "10", req.Target)
 		runCommand(cmd, send)
 	} else if req.Type == "tcp" {
-		runTcpPing(req.Target, req.Port, send)
+		cmd := exec.Command("tcping", "-c", "4", req.Target, fmt.Sprintf("%d", req.Port))
+		runCommand(cmd, send)
 	}
 }
 
@@ -100,7 +99,7 @@ func runCommand(cmd *exec.Cmd, send func(string, string)) {
 		send("error", err.Error())
 		return
 	}
-	
+
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		send("error", err.Error())
@@ -129,24 +128,4 @@ func runCommand(cmd *exec.Cmd, send func(string, string)) {
 	} else {
 		send("completed", "\nTest completed.")
 	}
-}
-
-func runTcpPing(target string, port int, send func(string, string)) {
-	addr := fmt.Sprintf("%s:%d", target, port)
-	send("running", fmt.Sprintf("TCP Ping to %s", addr))
-	
-	for i := 1; i <= 4; i++ {
-		start := time.Now()
-		conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
-		duration := time.Since(start)
-		
-		if err != nil {
-			send("running", fmt.Sprintf("Seq %d: Connection failed: %v", i, err))
-		} else {
-			conn.Close()
-			send("running", fmt.Sprintf("Seq %d: Connected in %v", i, duration))
-		}
-		time.Sleep(1 * time.Second)
-	}
-	send("completed", "\nTCP Ping completed.")
 }
