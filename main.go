@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/url"
 	"os/exec"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -45,19 +46,31 @@ func main() {
 	q.Set("token", *token)
 	u.RawQuery = q.Encode()
 
-	log.Printf("Connecting to %s", u.String())
+	for {
+		err := connectAndListen(u.String())
+		if err != nil {
+			log.Printf("Connection error: %v. Reconnecting in 5 seconds...", err)
+		} else {
+			log.Printf("Disconnected. Reconnecting in 5 seconds...")
+		}
+		time.Sleep(5 * time.Second)
+	}
+}
 
-	c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+func connectAndListen(urlStr string) error {
+	log.Printf("Connecting to %s", urlStr)
+
+	c, _, err := websocket.DefaultDialer.Dial(urlStr, nil)
 	if err != nil {
-		log.Fatal("dial:", err)
+		return fmt.Errorf("dial: %w", err)
 	}
 	defer c.Close()
+	log.Printf("Connected successfully!")
 
 	for {
 		_, message, err := c.ReadMessage()
 		if err != nil {
-			log.Println("read error:", err)
-			return
+			return fmt.Errorf("read error: %w", err)
 		}
 
 		var req TaskRequest
