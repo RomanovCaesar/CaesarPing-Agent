@@ -18,6 +18,7 @@ type TaskRequest struct {
 	Target string `json:"target"`
 	Type   string `json:"type"` // icmp, tcp, mtr
 	Port   int    `json:"port"`
+	Count  int    `json:"count"`
 }
 
 type TaskResponse struct {
@@ -81,14 +82,19 @@ func handleTask(c *websocket.Conn, req TaskRequest) {
 		c.WriteJSON(resp)
 	}
 
+	countStr := fmt.Sprintf("%d", req.Count)
+	if req.Count <= 0 {
+		countStr = "4"
+	}
+
 	if req.Type == "icmp" {
-		cmd := exec.Command("ping", "-c", "4", req.Target) // Linux ping.
+		cmd := exec.Command("ping", "-c", countStr, req.Target) // Linux ping.
 		runCommand(cmd, send)
 	} else if req.Type == "mtr" {
-		cmd := exec.Command("mtr", "-r", "-c", "10", req.Target)
+		cmd := exec.Command("mtr", "-r", "-c", countStr, req.Target)
 		runCommand(cmd, send)
 	} else if req.Type == "tcp" {
-		cmd := exec.Command("tcping", "-c", "4", req.Target, fmt.Sprintf("%d", req.Port))
+		cmd := exec.Command("tcping", "-c", countStr, req.Target, fmt.Sprintf("%d", req.Port))
 		runCommand(cmd, send)
 	}
 }
