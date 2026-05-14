@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os/exec"
 	"time"
@@ -60,8 +61,14 @@ func main() {
 func connectAndListen(urlStr string) error {
 	log.Printf("Connecting to %s", urlStr)
 
-	c, _, err := websocket.DefaultDialer.Dial(urlStr, nil)
+	headers := http.Header{}
+	headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	c, resp, err := websocket.DefaultDialer.Dial(urlStr, headers)
 	if err != nil {
+		if resp != nil {
+			return fmt.Errorf("dial: %w (status: %d)", err, resp.StatusCode)
+		}
 		return fmt.Errorf("dial: %w", err)
 	}
 	defer c.Close()
