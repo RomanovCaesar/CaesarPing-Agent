@@ -6,10 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os/exec"
+	"strings"
 	"time"
+	"context"
 
 	"github.com/gorilla/websocket"
 )
@@ -31,6 +34,9 @@ type TaskResponse struct {
 
 var serverUrl = flag.String("server", "ws://localhost:3000/ws/agent", "Backend WebSocket URL")
 var token = flag.String("token", "", "Agent Authentication Token")
+var bindIp = flag.String("bind", "auto", "Local IP to bind to (e.g., 143.14.86.197), or 'auto' to auto-detect primary physical interface")
+
+var resolvedBindIp string
 
 func main() {
 	flag.Parse()
@@ -46,6 +52,18 @@ func main() {
 	q := u.Query()
 	q.Set("token", *token)
 	u.RawQuery = q.Encode()
+
+	if *bindIp == "auto" {
+		resolvedBindIp = getPrimaryIP()
+		if resolvedBindIp != "" {
+			log.Printf("Auto-detected primary physical interface IP: %s", resolvedBindIp)
+		} else {
+			log.Printf("Could not auto-detect primary physical interface. Proceeding with default routing.")
+		}
+	} else if *bindIp != "" {
+		resolvedBindIp = *bindIp
+		log.Printf("Using explicitly bound IP: %s", resolvedBindIp)
+	}
 
 	for {
 		err := connectAndListen(u.String())
@@ -64,7 +82,24 @@ func connectAndListen(urlStr string) error {
 	headers := http.Header{}
 	headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-	c, resp, err := websocket.DefaultDialer.Dial(urlStr, headers)
+	dialer := websocket.DefaultDialer
+	if resolvedBindIp != "" {
+		localAddr, err := net.ResolveTCPAddr("tcp", resolvedBindIp+":0")
+		if err == nil {
+			dialer = &websocket.Dialer{
+				Proxy:            http.ProxyFromEnvironment,
+				HandshakeTimeout: 45 * time.Second,
+				NetDialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					d := &net.Dialer{LocalAddr: localAddr}
+					return d.DialContext(ctx, network, addr)
+				},
+			}
+		} else {
+			log.Printf("Invalid bind IP %s: %v", resolvedBindIp, err)
+		}
+	}
+
+	c, resp, err := dialer.Dial(urlStr, headers)
 	if err != nil {
 		if resp != nil {
 			return fmt.Errorf("dial: %w (status: %d)", err, resp.StatusCode)
@@ -108,15 +143,63 @@ func handleTask(c *websocket.Conn, req TaskRequest) {
 	}
 
 	if req.Type == "icmp" {
-		cmd := exec.Command("ping", "-c", countStr, req.Target) // Linux ping.
+		args := []string{"-c", countStr}
+		if resolvedBindIp != "" {
+			args = append(args, "-I", resolvedBindIp)
+		}
+		args = append(args, req.Target)
+		cmd := exec.Command("ping", args...)
 		runCommand(cmd, send)
 	} else if req.Type == "mtr" {
-		cmd := exec.Command("mtr", "-r", "-c", countStr, req.Target)
+		args := []string{"-r", "-c", countStr}
+		if resolvedBindIp != "" {
+			args = append(args, "-a", resolvedBindIp)
+		}
+		args = append(args, req.Target)
+		cmd := exec.Command("mtr", args...)
 		runCommand(cmd, send)
 	} else if req.Type == "tcp" {
 		cmd := exec.Command("tcping", "-c", countStr, req.Target, fmt.Sprintf("%d", req.Port))
 		runCommand(cmd, send)
 	}
+}
+
+func getPrimaryIP() string {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 || iface.Flags&net.FlagPointToPoint != 0 {
+			continue
+		}
+		name := iface.Name
+		if strings.HasPrefix(name, "lo") || strings.HasPrefix(name, "tun") || strings.HasPrefix(name, "tap") ||
+			strings.HasPrefix(name, "docker") || strings.HasPrefix(name, "br-") || strings.HasPrefix(name, "veth") ||
+			strings.HasPrefix(name, "wg") || strings.HasPrefix(name, "ppp") {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			
+			if ip != nil && !ip.IsLoopback() && !ip.IsPrivate() && ip.To4() != nil {
+				return ip.String()
+			}
+		}
+	}
+	return ""
 }
 
 func runCommand(cmd *exec.Cmd, send func(string, string)) {
