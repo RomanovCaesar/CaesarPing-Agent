@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 	"context"
@@ -137,10 +138,19 @@ func handleTask(c *websocket.Conn, req TaskRequest) {
 		c.WriteJSON(resp)
 	}
 
-	countStr := fmt.Sprintf("%d", req.Count)
-	if req.Count <= 0 {
-		countStr = "4"
+	// Reject anything that ping/mtr/tcping could parse as an option
+	if !isValidTarget(req.Target) {
+		send("error", "Invalid target")
+		return
 	}
+
+	count := req.Count
+	if count <= 0 {
+		count = 4
+	} else if count > maxCount {
+		count = maxCount
+	}
+	countStr := fmt.Sprintf("%d", count)
 
 	if req.Type == "icmp" {
 		args := []string{"-c", countStr}
@@ -159,9 +169,24 @@ func handleTask(c *websocket.Conn, req TaskRequest) {
 		cmd := exec.Command("mtr", args...)
 		runCommand(cmd, send)
 	} else if req.Type == "tcp" {
+		if req.Port < 1 || req.Port > 65535 {
+			send("error", "Invalid port")
+			return
+		}
 		cmd := exec.Command("tcping", "-c", countStr, req.Target, fmt.Sprintf("%d", req.Port))
 		runCommand(cmd, send)
 	}
+}
+
+const maxCount = 20
+
+var hostnameRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*\.?$`)
+
+func isValidTarget(target string) bool {
+	if net.ParseIP(target) != nil {
+		return true
+	}
+	return len(target) <= 253 && hostnameRe.MatchString(target)
 }
 
 func getPrimaryIP() string {
