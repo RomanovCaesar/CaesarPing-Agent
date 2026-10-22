@@ -2,18 +2,21 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
-	"context"
 
 	"github.com/gorilla/websocket"
 )
@@ -25,6 +28,7 @@ type TaskRequest struct {
 	Type   string `json:"type"` // icmp, tcp, mtr
 	Port   int    `json:"port"`
 	Count  int    `json:"count"`
+	Family string `json:"family"` // "4", "6" or "" (prefer IPv4)
 }
 
 type TaskResponse struct {
@@ -34,15 +38,21 @@ type TaskResponse struct {
 }
 
 var serverUrl = flag.String("server", "ws://localhost:3000/ws/agent", "Backend WebSocket URL")
-var token = flag.String("token", "", "Agent Authentication Token")
+var token = flag.String("token", "", "Agent Authentication Token (or set CAESARPING_TOKEN, which keeps it out of the process list)")
 var bindIp = flag.String("bind", "auto", "Local IP to bind to (e.g., 143.14.86.197), or 'auto' to auto-detect primary physical interface")
 
-var resolvedBindIp string
+var resolvedBindIp string // used for the connection to the server
+
+// Source addresses for tests, per family; a test only binds to the one matching its target
+var bindIPv4, bindIPv6 string
 
 func main() {
 	flag.Parse()
 	if *token == "" {
-		log.Fatal("Token is required")
+		*token = os.Getenv("CAESARPING_TOKEN")
+	}
+	if *token == "" {
+		log.Fatal("Token is required (-token or CAESARPING_TOKEN)")
 	}
 
 	u, err := url.Parse(*serverUrl)
@@ -50,19 +60,22 @@ func main() {
 		log.Fatal("Invalid server URL:", err)
 	}
 
-	q := u.Query()
-	q.Set("token", *token)
-	u.RawQuery = q.Encode()
-
 	if *bindIp == "auto" {
-		resolvedBindIp = getPrimaryIP()
-		if resolvedBindIp != "" {
-			log.Printf("Auto-detected primary physical interface IP: %s", resolvedBindIp)
+		bindIPv4 = getPrimaryIP(false)
+		bindIPv6 = getPrimaryIP(true)
+		resolvedBindIp = bindIPv4
+		if bindIPv4 != "" || bindIPv6 != "" {
+			log.Printf("Auto-detected primary physical interface IPs: IPv4=%q IPv6=%q", bindIPv4, bindIPv6)
 		} else {
 			log.Printf("Could not auto-detect primary physical interface. Proceeding with default routing.")
 		}
 	} else if *bindIp != "" {
 		resolvedBindIp = *bindIp
+		if addr, err := netip.ParseAddr(*bindIp); err == nil && addr.Unmap().Is4() {
+			bindIPv4 = addr.Unmap().String()
+		} else if err == nil {
+			bindIPv6 = addr.String()
+		}
 		log.Printf("Using explicitly bound IP: %s", resolvedBindIp)
 	}
 
@@ -82,6 +95,8 @@ func connectAndListen(urlStr string) error {
 
 	headers := http.Header{}
 	headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	// Sent as a header rather than in the URL, so it does not end up in proxy access logs
+	headers.Set("Authorization", "Bearer "+*token)
 
 	dialer := websocket.DefaultDialer
 	if resolvedBindIp != "" {
@@ -109,12 +124,22 @@ func connectAndListen(urlStr string) error {
 	}
 	defer c.Close()
 	log.Printf("Connected successfully!")
+	conn := &safeConn{c: c}
+
+	// The server pings every 30s. Without a read deadline a half-open connection
+	// (e.g. after a network outage) would block ReadMessage forever and never reconnect.
+	c.SetReadDeadline(time.Now().Add(readTimeout))
+	c.SetPingHandler(func(data string) error {
+		c.SetReadDeadline(time.Now().Add(readTimeout))
+		return c.WriteControl(websocket.PongMessage, []byte(data), time.Now().Add(10*time.Second))
+	})
 
 	for {
 		_, message, err := c.ReadMessage()
 		if err != nil {
 			return fmt.Errorf("read error: %w", err)
 		}
+		c.SetReadDeadline(time.Now().Add(readTimeout))
 
 		var req TaskRequest
 		if err := json.Unmarshal(message, &req); err != nil {
@@ -123,12 +148,30 @@ func connectAndListen(urlStr string) error {
 		}
 
 		if req.Action == "start_test" {
-			go handleTask(c, req)
+			go handleTask(conn, req)
 		}
 	}
 }
 
-func handleTask(c *websocket.Conn, req TaskRequest) {
+// safeConn serializes writes: gorilla/websocket allows only one concurrent writer,
+// and output from several tasks (and stdout/stderr of one task) arrives in parallel.
+type safeConn struct {
+	c  *websocket.Conn
+	mu sync.Mutex
+}
+
+func (s *safeConn) WriteJSON(v interface{}) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.c.WriteJSON(v)
+}
+
+// Limits how many ping/mtr/tcping processes run at once; further tasks wait.
+const maxConcurrentTasks = 8
+
+var taskSlots = make(chan struct{}, maxConcurrentTasks)
+
+func handleTask(c *safeConn, req TaskRequest) {
 	send := func(status, output string) {
 		resp := TaskResponse{
 			TaskId: req.TaskId,
@@ -144,6 +187,25 @@ func handleTask(c *websocket.Conn, req TaskRequest) {
 		return
 	}
 
+	taskSlots <- struct{}{}
+	defer func() { <-taskSlots }()
+
+	// Resolve here and run the tools against the checked address, so a DNS answer
+	// cannot change between the check and the test
+	addr, err := resolvePublicTarget(req.Target, req.Family)
+	if err != nil {
+		send("error", err.Error())
+		return
+	}
+	target := addr.String()
+
+	// Bind only to a source address of the same family as the target; binding an
+	// IPv4 source to an IPv6 target makes ping/mtr fail
+	bindAddr := bindIPv4
+	if addr.Is6() {
+		bindAddr = bindIPv6
+	}
+
 	count := req.Count
 	if count <= 0 {
 		count = 4
@@ -152,31 +214,39 @@ func handleTask(c *websocket.Conn, req TaskRequest) {
 	}
 	countStr := fmt.Sprintf("%d", count)
 
+	// Upper bound on a test's run time, so a hung tool does not hold a task slot forever
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second+time.Duration(count)*3*time.Second)
+	defer cancel()
+
 	if req.Type == "icmp" {
 		args := []string{"-c", countStr}
-		if resolvedBindIp != "" {
-			args = append(args, "-I", resolvedBindIp)
+		if bindAddr != "" {
+			args = append(args, "-I", bindAddr)
 		}
-		args = append(args, req.Target)
-		cmd := exec.Command("ping", args...)
+		args = append(args, target)
+		cmd := exec.CommandContext(ctx, "ping", args...)
 		runCommand(cmd, send)
 	} else if req.Type == "mtr" {
 		args := []string{"-r", "-c", countStr}
-		if resolvedBindIp != "" {
-			args = append(args, "-a", resolvedBindIp)
+		if bindAddr != "" {
+			args = append(args, "-a", bindAddr)
 		}
-		args = append(args, req.Target)
-		cmd := exec.Command("mtr", args...)
+		args = append(args, target)
+		cmd := exec.CommandContext(ctx, "mtr", args...)
 		runCommand(cmd, send)
 	} else if req.Type == "tcp" {
 		if req.Port < 1 || req.Port > 65535 {
 			send("error", "Invalid port")
 			return
 		}
-		cmd := exec.Command("tcping", "-c", countStr, req.Target, fmt.Sprintf("%d", req.Port))
+		cmd := exec.CommandContext(ctx, "tcping", "-c", countStr, target, fmt.Sprintf("%d", req.Port))
 		runCommand(cmd, send)
+	} else {
+		send("error", "Unsupported test type")
 	}
 }
+
+const readTimeout = 90 * time.Second
 
 const maxCount = 20
 
@@ -189,7 +259,85 @@ func isValidTarget(target string) bool {
 	return len(target) <= 253 && hostnameRe.MatchString(target)
 }
 
-func getPrimaryIP() string {
+// Loopback, private, link-local, CGNAT, documentation, multicast and similar ranges
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("::/128"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
+
+func isPublicAddr(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(addr) {
+			return false
+		}
+	}
+	return addr.IsValid()
+}
+
+// resolvePublicTarget returns the address to test: of the requested family ("4" or
+// "6"), or preferring IPv4 when family is empty. It refuses targets where any
+// resolved address is not public.
+func resolvePublicTarget(target, family string) (netip.Addr, error) {
+	if addr, err := netip.ParseAddr(target); err == nil {
+		addr = addr.Unmap()
+		if !isPublicAddr(addr) {
+			return netip.Addr{}, fmt.Errorf("Private, loopback and reserved addresses cannot be tested.")
+		}
+		if (family == "4" && !addr.Is4()) || (family == "6" && !addr.Is6()) {
+			return netip.Addr{}, fmt.Errorf("%s is not an IPv%s address", target, family)
+		}
+		return addr, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupNetIP(ctx, "ip", target)
+	if err != nil || len(addrs) == 0 {
+		return netip.Addr{}, fmt.Errorf("Failed to resolve %s", target)
+	}
+	var chosen netip.Addr
+	for _, a := range addrs {
+		a = a.Unmap()
+		if !isPublicAddr(a) {
+			return netip.Addr{}, fmt.Errorf("Private, loopback and reserved addresses cannot be tested.")
+		}
+		if (family == "4" && !a.Is4()) || (family == "6" && !a.Is6()) {
+			continue
+		}
+		if !chosen.IsValid() || (a.Is4() && !chosen.Is4()) {
+			chosen = a
+		}
+	}
+	if !chosen.IsValid() {
+		return netip.Addr{}, fmt.Errorf("%s has no IPv%s address", target, family)
+	}
+	return chosen, nil
+}
+
+// getPrimaryIP returns the first public address of the wanted family on a physical interface.
+func getPrimaryIP(wantIPv6 bool) string {
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return ""
@@ -218,9 +366,12 @@ func getPrimaryIP() string {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			
-			if ip != nil && !ip.IsLoopback() && !ip.IsPrivate() && ip.To4() != nil {
-				return ip.String()
+
+			if ip == nil || (ip.To4() == nil) != wantIPv6 {
+				continue
+			}
+			if a, ok := netip.AddrFromSlice(ip); ok && isPublicAddr(a) {
+				return a.Unmap().String()
 			}
 		}
 	}
